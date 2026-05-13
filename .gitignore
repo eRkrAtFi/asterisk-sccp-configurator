@@ -1,0 +1,11 @@
+# Sensitive – never commit
+config.php
+users.json
+contacts.json
+lines.json
+
+# Runtime backups
+*.backup
+
+# Temp files
+/tmp/
