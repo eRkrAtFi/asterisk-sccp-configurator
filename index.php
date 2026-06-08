@@ -73,7 +73,10 @@ $currentUser = getCurrentUser();
       label: '',
       pin: '1234',
       context: 'from-internal',
-      department: ''
+      department: '',
+      mac2: '',
+      fwd_number: '',
+      fwd_timeout: '30'
     };
 
     // All available phone models
@@ -202,8 +205,8 @@ $currentUser = getCurrentUser();
         setFormData(prev => ({
           ...prev,
           [name]: value,
-          // If label is empty or matches the *old* extension, auto-fill it
-          label: (prev.label === '' || prev.label === prev.extension) ? value : prev.label
+          // If description is empty or matches the *old* extension, auto-fill Device Description (not Label)
+          description: (prev.description === '' || prev.description === prev.extension) ? value : prev.description
         }));
       };
       
@@ -273,6 +276,17 @@ $currentUser = getCurrentUser();
                     {phoneModels.map(model => <option key={model} value={model}>Cisco {model}</option>)}
                   </select>
                 </div>
+                <div className="col-span-full">
+                  <label className="block text-sm font-semibold mb-1">Second MAC Address <span className="text-gray-400 font-normal">(optional — shared line)</span></label>
+                  <input
+                    type="text"
+                    name="mac2"
+                    value={formData.mac2 || ''}
+                    onChange={handleChange}
+                    placeholder="SEP001122334456 (leave empty if not needed)"
+                    className="w-full px-3 py-2 border rounded-lg"
+                  />
+                </div>
               </div>
 
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -319,6 +333,28 @@ $currentUser = getCurrentUser();
                     name="context"
                     value={formData.context}
                     onChange={handleChange}
+                    className="w-full px-3 py-2 border rounded-lg"
+                  />
+                </div>
+                <div>
+                  <label className="block text-sm font-semibold mb-1">Forward after (sec) <span className="text-gray-400 font-normal">(no answer)</span></label>
+                  <input
+                    type="number"
+                    name="fwd_timeout"
+                    value={formData.fwd_timeout || '30'}
+                    onChange={handleChange}
+                    placeholder="30"
+                    className="w-full px-3 py-2 border rounded-lg"
+                  />
+                </div>
+                <div>
+                  <label className="block text-sm font-semibold mb-1">Forward to number <span className="text-gray-400 font-normal">(optional)</span></label>
+                  <input
+                    type="text"
+                    name="fwd_number"
+                    value={formData.fwd_number || ''}
+                    onChange={handleChange}
+                    placeholder="e.g. 504 (empty = no forwarding)"
                     className="w-full px-3 py-2 border rounded-lg"
                   />
                 </div>
@@ -397,6 +433,7 @@ $currentUser = getCurrentUser();
       const [showDeleteContactConfirm, setShowDeleteContactConfirm] = useState(null);
       const [contactSearch, setContactSearch] = useState('');
       const [phoneSearch, setPhoneSearch] = useState('');
+      const [sortBy, setSortBy] = useState('name');
       const [infoPhone, setInfoPhone] = useState(null);   // phone object for info modal
       const [infoContact, setInfoContact] = useState(null); // contact object for info modal
 
@@ -411,6 +448,11 @@ $currentUser = getCurrentUser();
       const [editPhone, setEditPhone] = useState(null); // Holds the phone object being edited
       const [showDeleteConfirm, setShowDeleteConfirm] = useState(null); // Holds MAC of phone to delete
       const [showLogoutConfirm, setShowLogoutConfirm] = useState(false);
+      const [lockGranted, setLockGranted] = useState(true);
+      const [lockHolder, setLockHolder] = useState(null);
+      const [lockRequest, setLockRequest] = useState(null);
+      const [requestSent, setRequestSent] = useState(false);
+      const [configVersion, setConfigVersion] = useState(null);
       
       // Other Modals
       const [showReloadDialog, setShowReloadDialog] = useState(false);
@@ -432,6 +474,70 @@ $currentUser = getCurrentUser();
         const interval = setInterval(loadStatus, 30000); // Auto-refresh status
         return () => clearInterval(interval);
       }, []);
+
+      // --- Edit lock (concurrency) with idle auto-release ---
+      const haveLockRef = useRef(false);
+      const lastActivityRef = useRef(Date.now());
+      const suppressAcquireUntilRef = useRef(0);
+      const wantsAccessRef = useRef(false);
+      useEffect(() => {
+        const IDLE_MS = 120000; // release the lock after 2 min of inactivity
+        const releaseReq = () => {
+          try {
+            if (navigator.sendBeacon) navigator.sendBeacon(`${API_BASE}?action=lock_release`);
+            else fetch(`${API_BASE}?action=lock_release`, { keepalive: true });
+          } catch (e) {}
+          haveLockRef.current = false;
+        };
+        const acquire = async () => {
+          if (Date.now() < suppressAcquireUntilRef.current) return; // post-handoff cooldown
+          try {
+            const r = await fetch(`${API_BASE}?action=lock_acquire&active=1`);
+            const d = await r.json();
+            haveLockRef.current = !!d.granted;
+            setLockGranted(!!d.granted);
+            setLockHolder(d.holder || null);
+            setLockRequest(d.request || null);
+            if (d.granted) { setRequestSent(false); wantsAccessRef.current = false; }
+            else if (wantsAccessRef.current) { fetch(`${API_BASE}?action=lock_request`).catch(() => {}); }
+          } catch (e) {}
+        };
+        const bump = () => {
+          lastActivityRef.current = Date.now();
+          if (!haveLockRef.current) acquire(); // resume editing -> reclaim lock if free
+        };
+        const events = ['mousedown', 'keydown', 'touchstart'];
+        events.forEach(ev => window.addEventListener(ev, bump));
+        const tick = () => {
+          if (Date.now() - lastActivityRef.current > IDLE_MS) {
+            if (haveLockRef.current) { releaseReq(); setLockGranted(false); setLockHolder(null); }
+          } else {
+            acquire();
+          }
+        };
+        acquire();
+        const hb = setInterval(tick, 20000);
+        window.addEventListener('beforeunload', releaseReq);
+        return () => {
+          clearInterval(hb);
+          events.forEach(ev => window.removeEventListener(ev, bump));
+          window.removeEventListener('beforeunload', releaseReq);
+          releaseReq();
+        };
+      }, []);
+
+      const requestAccess = async () => {
+        wantsAccessRef.current = true;
+        try { await fetch(`${API_BASE}?action=lock_request`); setRequestSent(true); } catch (e) {}
+      };
+      const handoffLock = async () => {
+        try { await fetch(`${API_BASE}?action=lock_handoff`); } catch (e) {}
+        haveLockRef.current = false;
+        setLockGranted(false);
+        setLockHolder(lockRequest);
+        setLockRequest(null);
+        suppressAcquireUntilRef.current = Date.now() + 15000; // let the requester grab it
+      };
 
       const showToast = (text, type = 'info') => {
         setMessage({ text, type });
@@ -546,33 +652,42 @@ $currentUser = getCurrentUser();
           lines.forEach(line => lineMap.set(line.id, line));
 
           // --- FIX 1: Merge devices and lines into the single state ---
-          const mergedPhones = devices.map(device => {
-
-            // Extract extension from 'button' field (e.g., "line, 503")
+          const extToDevices = new Map();
+          devices.forEach(device => {
             let extension = '';
             if (device.button && device.button.startsWith('line,')) {
               extension = device.button.split(',')[1].trim();
             }
+            if (!extToDevices.has(extension)) extToDevices.set(extension, []);
+            extToDevices.get(extension).push(device);
+          });
 
-            const line = lineMap.get(extension) || {}; // Find matching line USING THE CORRECT EXTENSION
+          const mergedPhones = Array.from(extToDevices.entries()).map(([extension, devs]) => {
+            const device = devs[0];
+            const device2 = devs[1] || null;
+            const line = lineMap.get(extension) || {};
 
             return {
               // Device properties
               mac: device.mac,
+              mac2: device2 ? device2.mac : '',
               model: device.devicetype || device.model || '7960',
-              description: device.description || (line.label ? `${line.label}'s Phone` : ''), // Auto-generate description
-              extension: extension, // <-- Use the correct extension
+              description: device.description || (line.label ? `${line.label}'s Phone` : ''),
+              extension: extension,
 
               // Line properties
               label: line.label || '',
               pin: line.pin || '1234',
               context: line.context || 'from-internal',
               department: deptMap.get(extension) || '',
+              fwd_number: line.fwd_number || '',
+              fwd_timeout: line.fwd_timeout || '30',
             };
           });
           // --- END FIX 1 ---
 
           setProvisionedPhones(mergedPhones);
+          setConfigVersion(configData.version || null);
           
           // Also load initial status
           await loadStatus();
@@ -626,12 +741,13 @@ $currentUser = getCurrentUser();
         // --- Data Splitting Logic ---
         // Transform the single state array back into two arrays for the API
         
-        const devicesApi = provisionedPhones.map(p => ({
-          mac: p.mac,
-          model: p.model,
-          description: p.description,
-          extension: p.extension
-        }));
+        const devicesApi = provisionedPhones.flatMap(p => {
+          const d = [{ mac: p.mac, model: p.model, description: p.description, extension: p.extension }];
+          if (p.mac2 && p.mac2.trim()) {
+            d.push({ mac: p.mac2, model: p.model, description: (p.description || '') + ' (2)', extension: p.extension });
+          }
+          return d;
+        });
         
         const linesApi = provisionedPhones
           .filter(p => p.extension) // Only create lines for phones that have an extension
@@ -640,7 +756,9 @@ $currentUser = getCurrentUser();
             label: p.label,
             pin: p.pin,
             context: p.context,
-            description: p.label // Use label for description as well
+            description: p.label, // Use label for description as well
+            fwd_number: p.fwd_number || '',
+            fwd_timeout: p.fwd_timeout || '30'
           }));
         
         // --- End of Splitting Logic ---
@@ -649,10 +767,11 @@ $currentUser = getCurrentUser();
           const res = await fetch(API_BASE, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ devices: devicesApi, lines: linesApi })
+            body: JSON.stringify({ devices: devicesApi, lines: linesApi, version: configVersion })
           });
           const data = await res.json();
           if (data.success) {
+            if (data.version) setConfigVersion(data.version);
             setReloadResult(data.sccp_reload || data); // Handle both old/new save/reload responses
             setShowReloadDialog(true);
             showToast('Configuration saved successfully', 'success');
@@ -727,7 +846,7 @@ $currentUser = getCurrentUser();
             const existing = prev.findIndex(c => c.number === finalPhone.extension);
             let updated;
             if (existing >= 0) {
-              updated = prev.map((c, i) => i === existing ? { ...c, department: finalPhone.department || '' } : c);
+              updated = prev.map((c, i) => i === existing ? { ...c, name: finalPhone.label || c.name, department: finalPhone.department || '' } : c);
             } else {
               updated = [...prev, {
                 name: finalPhone.label || finalPhone.extension,
@@ -798,13 +917,17 @@ $currentUser = getCurrentUser();
         setSaving(true);
         
         // Split data for API
-        const devicesApi = provisionedPhones.map(p => ({
-          mac: p.mac, model: p.model, description: p.description, extension: p.extension
-        }));
+        const devicesApi = provisionedPhones.flatMap(p => {
+          const d = [{ mac: p.mac, model: p.model, description: p.description, extension: p.extension }];
+          if (p.mac2 && p.mac2.trim()) {
+            d.push({ mac: p.mac2, model: p.model, description: (p.description || '') + ' (2)', extension: p.extension });
+          }
+          return d;
+        });
         const linesApi = provisionedPhones
           .filter(p => p.extension)
           .map(p => ({
-            id: p.extension, label: p.label, pin: p.pin, context: p.context, description: p.label
+            id: p.extension, label: p.label, pin: p.pin, context: p.context, description: p.label, fwd_number: p.fwd_number || '', fwd_timeout: p.fwd_timeout || '30'
           }));
 
         try {
@@ -900,18 +1023,18 @@ $currentUser = getCurrentUser();
             />
           )}
           
-          <div className="max-w-7xl mx-auto">
+          <div className="max-w-[1536px] mx-auto">
             {/* Header */}
             <div className="bg-gradient-to-r from-blue-600 to-blue-800 rounded-xl shadow-2xl p-4 sm:p-6 mb-6">
-              <div className="flex flex-wrap items-center justify-between gap-3">
-                <div className="flex items-center gap-3 text-white">
-                  <Phone />
-                  <div>
-                    <h1 className="text-xl sm:text-3xl font-bold">SCCP Configurator</h1>
-                    <p className="text-blue-100 text-xs sm:text-sm hidden sm:block">Cisco SCCP phones management for Asterisk</p>
-                  </div>
+              <div className="flex items-center gap-3 text-white mb-4">
+                <Phone />
+                <div>
+                  <h1 className="text-xl sm:text-3xl font-bold">SCCP Configurator</h1>
+                  <p className="text-blue-100 text-xs sm:text-sm hidden sm:block">Cisco SCCP phones management for Asterisk</p>
                 </div>
-                <div className="flex flex-wrap items-center gap-2">
+              </div>
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div className="flex flex-wrap items-center gap-2 sm:gap-3">
                   <button
                     onClick={() => setShowXMLSettings(true)}
                     className="bg-purple-500 text-white px-3 py-2 rounded-lg hover:bg-purple-600 transition font-semibold flex items-center gap-2"
@@ -936,11 +1059,33 @@ $currentUser = getCurrentUser();
                   </button>
                   <button
                     onClick={saveConfig}
-                    disabled={saving}
-                    className={`bg-green-500 text-white px-3 py-2 rounded-lg hover:bg-green-600 transition font-semibold flex items-center gap-2 ${saving ? 'opacity-60 animate-pulse' : ''}`}
+                    disabled={saving || !lockGranted}
+                    title={!lockGranted ? ('Locked by ' + (lockHolder || 'someone else') + ' - wait and refresh (Ctrl+F5)') : 'Save & Apply'}
+                    className={`${lockGranted ? 'bg-green-500 hover:bg-green-600' : 'bg-gray-400 cursor-not-allowed'} text-white px-3 py-2 rounded-lg transition font-semibold flex items-center gap-2 ${saving ? 'opacity-60 animate-pulse' : ''}`}
                   >
-                    <Save /> <span className="hidden sm:inline">{saving ? 'Saving…' : 'Save & Apply'}</span>
+                    <Save /> <span className="hidden sm:inline">{!lockGranted ? ('🔒 ' + (lockHolder ? ('Locked by ' + lockHolder) : 'Locked')) : (saving ? 'Saving…' : 'Save & Apply')}</span>
                   </button>
+                  {!lockGranted && (
+                    <button
+                      onClick={requestAccess}
+                      disabled={requestSent}
+                      title="Ask the current editor to release the lock"
+                      className={`px-3 py-2 rounded-lg font-semibold text-white flex items-center gap-2 ${requestSent ? 'bg-gray-400 cursor-default' : 'bg-amber-500 hover:bg-amber-600'}`}
+                    >
+                      {requestSent ? '⏳ Requested…' : '✋ Request access'}
+                    </button>
+                  )}
+                  {lockGranted && lockRequest && (
+                    <button
+                      onClick={handoffLock}
+                      title={lockRequest + ' is waiting to edit'}
+                      className="px-3 py-2 rounded-lg font-semibold text-white bg-orange-500 hover:bg-orange-600 flex items-center gap-2 animate-pulse"
+                    >
+                      🔔 {lockRequest} wants access — Release
+                    </button>
+                  )}
+                </div>
+                <div className="flex items-center gap-2 ml-auto">
                   <div className="hidden sm:flex items-center gap-2 bg-white/10 px-3 py-2 rounded-lg text-white">
                     <UserIcon />
                     <div>
@@ -995,14 +1140,23 @@ $currentUser = getCurrentUser();
                 </button>
               </div>
 
-              <div className="mb-4">
+              <div className="mb-4 flex gap-2">
                 <input
                   type="text"
                   placeholder="Search by person, extension, description or department…"
                   value={phoneSearch}
                   onChange={e => setPhoneSearch(e.target.value)}
-                  className="w-full px-4 py-2 border rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-300"
+                  className="flex-1 px-4 py-2 border rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-300"
                 />
+                <select
+                  value={sortBy}
+                  onChange={e => setSortBy(e.target.value)}
+                  className="px-3 py-2 border rounded-lg text-sm bg-white focus:outline-none focus:ring-2 focus:ring-blue-300"
+                  title="Sort order"
+                >
+                  <option value="name">Sort: Name (A–Z)</option>
+                  <option value="extension">Sort: Extension</option>
+                </select>
               </div>
 
               {/* Mobile card view */}
@@ -1015,6 +1169,10 @@ $currentUser = getCurrentUser();
                     || (phone.description || '').toLowerCase().includes(q)
                     || (phone.department  || '').toLowerCase().includes(q)
                     || (phone.mac         || '').toLowerCase().includes(q);
+                });
+                filteredPhones.sort((a, b) => {
+                  if (sortBy === 'extension') return (parseInt(a.extension, 10) || 0) - (parseInt(b.extension, 10) || 0);
+                  return (a.label || '').localeCompare(b.label || '', undefined, { sensitivity: 'base' });
                 });
                 return (
                   <>
@@ -1356,6 +1514,7 @@ $currentUser = getCurrentUser();
                   <div className="space-y-3 text-sm">
                     {[
                       ['MAC Address',        infoPhone.mac],
+                      ['MAC Address 2',      infoPhone.mac2 || '—'],
                       ['Model',              `Cisco ${infoPhone.model}`],
                       ['Extension',          infoPhone.extension],
                       ['Caller ID (Label)',   infoPhone.label],
@@ -1363,6 +1522,7 @@ $currentUser = getCurrentUser();
                       ['Department',         infoPhone.department || '—'],
                       ['PIN',                infoPhone.pin],
                       ['Context',            infoPhone.context],
+                      ['Forward',            infoPhone.fwd_number ? (infoPhone.fwd_number + ' (after ' + (infoPhone.fwd_timeout||'30') + 's)') : '—'],
                       ['Device Status',      deviceStatus[infoPhone.mac] || 'unknown'],
                       ['Line Status',        lineStatus[infoPhone.extension] || 'unknown'],
                     ].map(([label, value]) => (

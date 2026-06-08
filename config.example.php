@@ -20,6 +20,7 @@ define('ASTERISK_CLI',           '/usr/sbin/asterisk');
 define('TFTP_PATH',              '/var/lib/tftpboot');
 
 // === SCCP DEFAULTS ===
+define('SCCP_LANGUAGE',        'en');   // Asterisk sound-prompt language (e.g. en, cs, de)
 define('SCCP_SERVERNAME',      'FreePBX');
 define('SCCP_CONTEXT_DEFAULT', 'from-internal');
 define('SCCP_CONTEXT',         'from-internal-custom');

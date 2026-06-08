@@ -9,3 +9,11 @@ lines.json
 
 # Temp files
 /tmp/
+
+# Runtime data (per-deployment)
+forwards.json
+ring_also.json
+extra_buttons.json
+edit_lock.json
+lock_request.json
+*.bak

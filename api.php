@@ -3,6 +3,27 @@
 require_once 'auth.php';
 require_once 'logger.php';
 
+function lockCurrentUser() { return $_SESSION['sccp_username'] ?? 'unknown'; }
+function lockRead() {
+    if (!file_exists(LOCK_FILE)) return null;
+    $d = json_decode(@file_get_contents(LOCK_FILE), true);
+    if (!is_array($d) || empty($d['user']) || empty($d['ts'])) return null;
+    if ((time() - (int)$d['ts']) > LOCK_TTL) return null;
+    return $d;
+}
+function lockWrite($user) { @file_put_contents(LOCK_FILE, json_encode(['user'=>$user,'ts'=>time()])); @chmod(LOCK_FILE, 0644); }
+function lockClear() { if (file_exists(LOCK_FILE)) @unlink(LOCK_FILE); }
+function requestRead() {
+    if (!file_exists(REQUEST_FILE)) return null;
+    $d = json_decode(@file_get_contents(REQUEST_FILE), true);
+    if (!is_array($d) || empty($d['user']) || empty($d['ts'])) return null;
+    if ((time() - (int)$d['ts']) > 60) return null;
+    return $d;
+}
+function requestWrite($user) { @file_put_contents(REQUEST_FILE, json_encode(['user'=>$user,'ts'=>time()])); @chmod(REQUEST_FILE, 0644); }
+function requestClear() { if (file_exists(REQUEST_FILE)) @unlink(REQUEST_FILE); }
+
+
 /**
  * API Access Guardian
  * This function checks authentication for API calls.
@@ -74,6 +95,12 @@ header('Access-Control-Allow-Headers: Content-Type');
 
 // All configuration constants are loaded via auth.php -> config.php
 define('CONTACTS_FILE', __DIR__ . '/contacts.json');
+define('FORWARDS_FILE', __DIR__ . '/forwards.json');
+define('EXTRABTN_FILE', __DIR__ . '/extra_buttons.json');
+define('RINGALSO_FILE', __DIR__ . '/ring_also.json');
+define('LOCK_FILE', __DIR__ . '/edit_lock.json');
+define('REQUEST_FILE', __DIR__ . '/lock_request.json');
+define('LOCK_TTL', 120);
 
 // Function to read SCCP configuration
 function readSCCPConfig() {
@@ -112,7 +139,12 @@ function readSCCPConfig() {
         
         if (strpos($line, '=') !== false) {
             list($key, $value) = array_map('trim', explode('=', $line, 2));
-            $currentData[$key] = $value;
+            // For 'button' keep only the FIRST (device's own line); extra buttons = shared/extra, ignore
+            if ($key === 'button' && isset($currentData['button'])) {
+                // skip - keep first button only
+            } else {
+                $currentData[$key] = $value;
+            }
         }
     }
     
@@ -136,6 +168,7 @@ function readSCCPConfig() {
  * @return bool Success status of the write operation
  */
 function writeSCCPConfig($devices, $lines) {
+    $extraButtons = file_exists(EXTRABTN_FILE) ? (json_decode(file_get_contents(EXTRABTN_FILE), true) ?: []) : [];
     // Create a backup of the current configuration before making changes
     if (file_exists(SCCP_CONF_PATH)) {
         copy(SCCP_CONF_PATH, SCCP_CONF_BACKUP);
@@ -158,11 +191,16 @@ function writeSCCPConfig($devices, $lines) {
     $config .= "allow = g729\n";
     $config .= "firstdigittimeout = 16\n";
     $config .= "digittimeout = 8\n";
-    $config .= "language = en\n";
-    $config .= "deny = 0.0.0.0/0.0.0.0\n";
-    $config .= "permit = $network\n";
-    $config .= "localnet = $network\n";
-    $config .= "earlyrtp = none\n";
+    $config .= "language = " . (defined('SCCP_LANGUAGE') ? SCCP_LANGUAGE : 'en') . "\n";
+    $config .= "deny = 0.0.0.0/0.0.0.0
+";
+    $networks = defined('SCCP_NETWORKS') ? unserialize(SCCP_NETWORKS) : [$network];
+    foreach ($networks as $net) { $config .= "permit = $net
+"; }
+    foreach ($networks as $net) { $config .= "localnet = $net
+"; }
+    $config .= "earlyrtp = none
+";
     $config .= "directrtp = yes\n\n";
     
     // Build the [lines] section
@@ -226,6 +264,12 @@ foreach ($devices as $device) {
     if (!empty($extension)) {
 
         $config .= "button = line, " . $extension . "\n";
+        if (!empty($extraButtons[$deviceName])) {
+            foreach ($extraButtons[$deviceName] as $xl) {
+                $config .= "button = line, " . $xl . "
+";
+            }
+        }
 
         generateSEPXML(
             $cleanMac,
@@ -316,7 +360,28 @@ $xml = '<?xml version="1.0" encoding="UTF-8"?>
 }
 
 // Function to manage dialplan for SCCP extensions
+function readForwards() {
+    if (!file_exists(FORWARDS_FILE)) { return []; }
+    return json_decode(file_get_contents(FORWARDS_FILE), true) ?: [];
+}
+
+function writeForwards($lines) {
+    $fwd = [];
+    foreach ($lines as $line) {
+        $num = trim($line['fwd_number'] ?? '');
+        if ($num !== '') {
+            $t = (int)($line['fwd_timeout'] ?? 30);
+            if ($t <= 0) { $t = 30; }
+            $fwd[$line['id']] = ['number' => $num, 'timeout' => $t];
+        }
+    }
+    $r = file_put_contents(FORWARDS_FILE, json_encode($fwd, JSON_PRETTY_PRINT));
+    if ($r !== false) { @chmod(FORWARDS_FILE, 0644); @chown(FORWARDS_FILE, 'asterisk'); }
+    return $r !== false;
+}
+
 function writeDialplan($lines) {
+    $ringAlso = file_exists(RINGALSO_FILE) ? (json_decode(file_get_contents(RINGALSO_FILE), true) ?: []) : [];
     if (file_exists(EXTENSIONS_CONF_PATH)) {
         copy(EXTENSIONS_CONF_PATH, EXTENSIONS_CONF_BACKUP);
     }
@@ -365,15 +430,35 @@ function writeDialplan($lines) {
     foreach ($lines as $line) {
         $ext = $line['id'];
         $label = $line['label'] ?? "Extension {$ext}";
+        $fwdNum = trim($line['fwd_number'] ?? '');
+        $fwdTimeout = (int)($line['fwd_timeout'] ?? 30);
+        if ($fwdTimeout <= 0) { $fwdTimeout = 30; }
+        $ringTimeout = ($fwdNum !== '') ? $fwdTimeout : 30;
 
         $dialplan .= "; {$label}\n";
         $dialplan .= "exten => {$ext},1,NoOp(SCCP Extension {$ext} - {$label})\n";
-        $dialplan .= " same => n,Dial(Local/{$ext}@sccp-direct/n,30,tT)\n";
-        $dialplan .= " same => n,GotoIf(\$[\"\${DIALSTATUS}\" = \"BUSY\"]?busy:unavail)\n";
-        $dialplan .= " same => n(unavail),VoiceMail({$ext}@default,u)\n";
-        $dialplan .= " same => n,Hangup()\n";
-        $dialplan .= " same => n(busy),VoiceMail({$ext}@default,b)\n";
-        $dialplan .= " same => n,Hangup()\n\n";
+        $dialTarget = "Local/{$ext}@sccp-direct/n";
+        if (!empty($ringAlso[$ext])) {
+            foreach ($ringAlso[$ext] as $ra) { $dialTarget .= "&Local/{$ra}@sccp-direct/n"; }
+        }
+        $dialplan .= " same => n,Dial({$dialTarget},{$ringTimeout},tT)
+";
+        if ($fwdNum !== '') {
+            $dialplan .= " same => n,GotoIf(\$[\"\${DIALSTATUS}\" = \"ANSWER\"]?fwdend)\n";
+            $dialplan .= " same => n,GotoIf(\$[\"\${DIALSTATUS}\" = \"BUSY\"]?fwdbusy)\n";
+            $dialplan .= " same => n,NoOp(No answer - forwarding {$ext} to {$fwdNum})\n";
+            $dialplan .= " same => n,Dial(Local/{$fwdNum}@from-internal/n,30,tT)\n";
+            $dialplan .= " same => n,Hangup()\n";
+            $dialplan .= " same => n(fwdbusy),VoiceMail({$ext}@default,b)\n";
+            $dialplan .= " same => n,Hangup()\n";
+            $dialplan .= " same => n(fwdend),Hangup()\n\n";
+        } else {
+            $dialplan .= " same => n,GotoIf(\$[\"\${DIALSTATUS}\" = \"BUSY\"]?busy:unavail)\n";
+            $dialplan .= " same => n(unavail),VoiceMail({$ext}@default,u)\n";
+            $dialplan .= " same => n,Hangup()\n";
+            $dialplan .= " same => n(busy),VoiceMail({$ext}@default,b)\n";
+            $dialplan .= " same => n,Hangup()\n\n";
+        }
     }
 
     // sccp-direct context: proxies calls to SCCP channel
@@ -566,7 +651,15 @@ try {
         case 'GET':
             if ($requestAction === 'config') {
                 $config = readSCCPConfig();
-                echo json_encode(['success' => true, 'data' => $config]);
+                $fwd = readForwards();
+                foreach ($config['lines'] as &$__ln) {
+                    if (isset($fwd[$__ln['id']])) {
+                        $__ln['fwd_number'] = $fwd[$__ln['id']]['number'];
+                        $__ln['fwd_timeout'] = (string)$fwd[$__ln['id']]['timeout'];
+                    }
+                }
+                unset($__ln);
+                echo json_encode(['success' => true, 'data' => $config, 'version' => (string)@filemtime(SCCP_CONF_PATH)]);
                 
             } elseif ($requestAction === 'status') {
                 $devices = getSCCPDevices();
@@ -592,6 +685,33 @@ try {
                     'lines' => $lines
                 ]);
                 
+            } elseif ($requestAction === 'lock_acquire' || $requestAction === 'lock_heartbeat') {
+                $me = lockCurrentUser(); $lock = lockRead(); $req = requestRead();
+                $active = (($_GET['active'] ?? '') === '1'); // proof of activity from current code; old tabs omit it
+                if (!$active) {
+                    echo json_encode(['granted'=>($lock && $lock['user']===$me), 'holder'=>($lock['user'] ?? null), 'request'=>($req['user'] ?? null)]);
+                } elseif ($lock === null || $lock['user'] === $me) {
+                    lockWrite($me);
+                    if ($req && $req['user'] === $me) { requestClear(); $req = null; }
+                    echo json_encode(['granted'=>true,'holder'=>$me, 'request'=>($req['user'] ?? null)]);
+                } else {
+                    echo json_encode(['granted'=>false,'holder'=>$lock['user'], 'request'=>($req['user'] ?? null)]);
+                }
+            } elseif ($requestAction === 'lock_status') {
+                $me = lockCurrentUser(); $lock = lockRead(); $req = requestRead();
+                echo json_encode(['locked'=>$lock!==null,'holder'=>$lock['user']??null,'mine'=>($lock && $lock['user']===$me),'request'=>($req['user']??null)]);
+            } elseif ($requestAction === 'lock_release') {
+                $me = lockCurrentUser(); $lock = lockRead();
+                if ($lock === null || $lock['user'] === $me) { lockClear(); }
+                echo json_encode(['released'=>true]);
+            } elseif ($requestAction === 'lock_request') {
+                $me = lockCurrentUser(); $lock = lockRead();
+                if ($lock && $lock['user'] !== $me) { requestWrite($me); }
+                echo json_encode(['requested'=>true]);
+            } elseif ($requestAction === 'lock_handoff') {
+                $me = lockCurrentUser(); $lock = lockRead();
+                if ($lock === null || $lock['user'] === $me) { lockClear(); requestClear(); }
+                echo json_encode(['handoff'=>true]);
             } elseif ($requestAction === 'test') {
                 echo json_encode([
                     'success' => true,
@@ -713,6 +833,24 @@ try {
                 break;
             }
 
+            // --- Concurrency lock: only the holder can save ---
+            $me = lockCurrentUser(); $lock = lockRead();
+            if ($lock !== null && $lock['user'] !== $me) {
+                http_response_code(409);
+                echo json_encode(['success'=>false,'error'=>'Configuration is currently being edited by '.$lock['user'].'. Please wait and refresh (Ctrl+F5).']);
+                break;
+            }
+            lockWrite($me);
+
+            // --- Version check: reject saves from a stale tab (config changed in the meantime) ---
+            $clientVer = isset($input['version']) ? (string)$input['version'] : null;
+            $curVer = (string)@filemtime(SCCP_CONF_PATH);
+            if ($clientVer === null || $clientVer === '' || $clientVer !== $curVer) {
+                http_response_code(409);
+                echo json_encode(['success'=>false,'error'=>'Configuration changed in the meantime (someone saved, or you have an old tab). Refresh (Ctrl+F5) and redo your change.']);
+                break;
+            }
+
             // --- Default POST: save full config and reload Asterisk ---
 
             // Snapshot old config for audit diff
@@ -729,6 +867,7 @@ try {
             if (!$dialplanResult) {
                 throw new Exception('Failed to write dialplan configuration');
             }
+            writeForwards($input['lines']);
 
             // Log configuration changes
             diffAndLog($oldConfig, $input['lines'], $input['devices']);
@@ -743,7 +882,8 @@ try {
                 'success' => true,
                 'message' => 'Configuration saved, SCCP and dialplan reloaded',
                 'sccp_reload' => $sccpReload,
-                'dialplan_reload' => $dialplanReload
+                'dialplan_reload' => $dialplanReload,
+                'version' => (string)@filemtime(SCCP_CONF_PATH)
             ]);
             break;
             
