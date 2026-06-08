@@ -13,8 +13,28 @@ Web-based management interface for Cisco SCCP phones on Asterisk with chan_sccp.
 
 - Provision SCCP phones (sccp.conf + SEP*.cnf.xml via TFTP)
 - Auto-generate Asterisk dialplan for SCCP extensions
+- Shared device — assign a second MAC so two phones share one line
+- Call forwarding — forward to another number on no-answer (per extension)
+- Simultaneous ring (ring group) — also ring other extensions when one is
+  called, so colleagues can see and pick up the call
 - Phone directory (served to phones via XML)
+- Sortable phone list (by name or extension) with search
+- Multi-admin safe editing — exclusive edit lock, optimistic version check,
+  and a "request access" hand-off flow (see below)
 - Audit log — append-only, CSV export
+
+## Multi-admin editing
+
+Every save regenerates the whole config from the browser's state, so two people
+editing at once could overwrite each other. Three layers prevent that:
+
+- **Edit lock** — only one user edits at a time; others are read-only. The lock
+  auto-releases after a couple of minutes of inactivity (or when the tab closes).
+- **Version check** — each save carries the config version it was loaded from.
+  If the config changed in the meantime (someone else saved, or an outdated tab),
+  the save is rejected and the user is asked to refresh — no silent overwrites.
+- **Request access** — a locked-out user can request access; the current editor
+  gets a notification and can hand the lock over.
 
 ## Setup
 
@@ -77,3 +97,7 @@ php manage_users.php list
 ├── config.example.php  Configuration template
 └── whoami.php          Debug endpoint
 ```
+
+Runtime data files (auto-created, git-ignored): `contacts.json`, `forwards.json`,
+`ring_also.json`, `lines.json`, plus `edit_lock.json` / `lock_request.json` for
+the editing lock.
