@@ -1140,6 +1140,32 @@ $currentUser = getCurrentUser();
                 </button>
               </div>
 
+              {/* --- STATUS SUMMARY --- lines added / online / offline */}
+              {(() => {
+                const isOnl = (mac) => { const s = (deviceStatus[mac] || '').toString().toLowerCase(); return s === 'online' || s === 'registered' || s === 'ok'; };
+                const total = provisionedPhones.length;
+                const online = provisionedPhones.filter(p => isOnl(p.mac) || (p.mac2 && isOnl(p.mac2))).length;
+                const offline = total - online;
+                return (
+                  <div className="flex flex-wrap gap-3 mb-4">
+                    <div className="flex items-center gap-2 px-4 py-2 rounded-lg bg-gray-100 text-gray-700">
+                      <span className="text-2xl font-bold leading-none">{total}</span>
+                      <span className="text-sm font-medium">Lines total</span>
+                    </div>
+                    <div className="flex items-center gap-2 px-4 py-2 rounded-lg bg-green-100 text-green-700">
+                      <span className="w-2.5 h-2.5 rounded-full bg-green-500"></span>
+                      <span className="text-2xl font-bold leading-none">{online}</span>
+                      <span className="text-sm font-medium">Online</span>
+                    </div>
+                    <div className="flex items-center gap-2 px-4 py-2 rounded-lg bg-red-100 text-red-700">
+                      <span className="w-2.5 h-2.5 rounded-full bg-red-500"></span>
+                      <span className="text-2xl font-bold leading-none">{offline}</span>
+                      <span className="text-sm font-medium">Offline</span>
+                    </div>
+                  </div>
+                );
+              })()}
+
               <div className="mb-4 flex gap-2">
                 <input
                   type="text"
