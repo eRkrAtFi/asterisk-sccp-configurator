@@ -872,6 +872,26 @@ try {
             // Log configuration changes
             diffAndLog($oldConfig, $input['lines'], $input['devices']);
 
+            // --- Cascade: when a line is removed, also remove its directory contact ---
+            $oldIds = array_map(fn($l) => trim((string)($l['id'] ?? '')), $oldConfig['lines']);
+            $newIds = array_map(fn($l) => trim((string)($l['id'] ?? '')), $input['lines']);
+            $removedIds = array_values(array_diff($oldIds, $newIds));
+            if (!empty($removedIds)) {
+                $oldContacts = file_exists(CONTACTS_FILE) ? (json_decode(file_get_contents(CONTACTS_FILE), true) ?: []) : [];
+                $newContacts = array_values(array_filter($oldContacts,
+                    fn($c) => !in_array(trim((string)($c['number'] ?? '')), $removedIds, true)));
+                if (count($newContacts) !== count($oldContacts)) {
+                    file_put_contents(CONTACTS_FILE, json_encode($newContacts, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE));
+                    @chmod(CONTACTS_FILE, 0644);
+                    foreach ($oldContacts as $c) {
+                        $num = trim((string)($c['number'] ?? ''));
+                        if (in_array($num, $removedIds, true)) {
+                            logAudit('contact_remove', 'contact', $num, 'Contact removed (line deleted): ' . ($c['name'] ?? '') . ' (' . $num . ')');
+                        }
+                    }
+                }
+            }
+
             // Reload SCCP
             $sccpReload = reloadSCCP();
 
